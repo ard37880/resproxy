@@ -122,8 +122,7 @@ def exit_ip(proxies):
     # Use the system proxy, the same path the browser takes, so this shows
     # what apps really get, on or off.
     try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
-        return json.load(opener.open("https://ipinfo.io/json", timeout=15))
+        return resproxy.lookup_exit_ip(proxies)
     except Exception as e:
         return {"error": str(e)[:60]}
 
@@ -185,11 +184,14 @@ def info_lines(cfg, st, ip, proxies, bars=True):
     elif "error" in ip:
         lines.append(label("Exit IP", f"{YELLOW}unreachable ({ip['error']}){RESET}"))
     else:
-        lines += [
-            label("Exit IP", str(ip.get("ip", "?")) + ("" if on else f" {DIM}({off_note(proxies)}){RESET}")),
-            label("Location", f"{ip.get('city', '?')}, {ip.get('region', '?')}, {ip.get('country', '?')}"),
-            label("ISP", ip.get("org", "?")),
-        ]
+        lines.append(label("Exit IP", str(ip.get("ip", "?"))
+                           + ("" if on else f" {DIM}({off_note(proxies)}){RESET}")))
+        # The last fallback site only knows the IP, not where it is.
+        if ip.get("city") or ip.get("country"):
+            lines += [
+                label("Location", ", ".join(str(ip.get(k) or "?") for k in ("city", "region", "country"))),
+                label("ISP", ip.get("org") or "?"),
+            ]
     lines += [
         label("Upstream", f"{cfg['upstream_host']}:{cfg['upstream_port']}"),
         label("Region", region.group(1).upper() if region else "any"),

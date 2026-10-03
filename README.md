@@ -1,7 +1,7 @@
 # resproxy
 
 ![macOS](https://img.shields.io/badge/macOS-working-brightgreen?logo=apple&logoColor=white)
-![Windows](https://img.shields.io/badge/Windows-in%20testing-yellow?logo=windows&logoColor=white)
+![Windows](https://img.shields.io/badge/Windows-working-brightgreen?logo=windows&logoColor=white)
 ![Linux](https://img.shields.io/badge/Linux-in%20testing-yellow?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python&logoColor=white)
 
@@ -19,8 +19,8 @@ without any setup of their own.
 
 It can also solve captchas for your own Python scripts through 2captcha.
 
-Needs Python 3.8 or newer, nothing else to install. Works on macOS today.
-Windows and Linux support is in testing. On Linux it switches the proxy on
+Needs Python 3.8 or newer, nothing else to install. Works on macOS and
+Windows. Linux support is in testing. On Linux it switches the proxy on
 desktops that use GNOME settings (GNOME, Ubuntu, Cinnamon, Budgie, Pantheon).
 
 ## Setup
@@ -31,7 +31,8 @@ cd resproxy
 cp config.example.json config.json
 ```
 
-On Windows, use `copy` instead of `cp`.
+On Windows, use `copy` instead of `cp`. Run everything below from inside the
+`resproxy` folder, or the commands won't find the files.
 
 Open `config.json` and fill in your details:
 
@@ -85,27 +86,19 @@ Want to just type `proxy`? Add this to `~/.zshrc` (or `~/.bashrc` on Linux):
 alias proxy="python3 ~/resproxy/proxy"
 ```
 
-On Windows, PowerShell doesn't run profile scripts until you allow it, and
-the profile file may not exist yet. Run this once:
+On Windows, PowerShell doesn't run profile scripts until you allow it. Run
+this once:
 
 ```powershell
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned -Force
 ```
 
-then this, which opens the profile in Notepad:
+then this, with the path changed to wherever you cloned it:
 
 ```powershell
-if (!(Test-Path $PROFILE)) { New-Item -Force -ItemType File $PROFILE }
-notepad $PROFILE
+Add-Content $PROFILE 'function proxy { py "$HOME\Desktop\resproxy\proxy" }'
+. $PROFILE
 ```
-
-In Notepad, add this line, save, and open a new PowerShell window:
-
-```powershell
-function proxy { py "$HOME\resproxy\proxy" }
-```
-
-(change the path to wherever you cloned it)
 
 No dashboard needed? `python3 resproxy.py on`, `off` and `status` (`py` instead
 of `python3` on Windows) do the same from any terminal.
@@ -178,6 +171,11 @@ slowly (a few KB a second), the connection can be cut after 45 seconds even
 though data is still coming in. And a misbehaving server that sends endless
 headers to an app that has stopped reading can keep that one connection open
 until you turn the proxy off.
+
+**Exit IP says unreachable but the proxy is ON.**
+The proxy is fine. The sites that look up your IP sometimes refuse a busy
+residential IP (other people share it). It tries three of them; press `4` to
+check again.
 
 **My IP keeps changing.**
 That's normal for rotating residential proxies. Most providers give you a new

@@ -2104,6 +2104,36 @@ MESSAGES = {"broken": BROKEN_MSG, "partial": PARTIAL_MSG, "unfinished": UNFINISH
             "unknown": UNKNOWN_MSG}
 
 
+# Free IP lookup sites, tried in order. Residential IPs are shared, so one
+# site often refuses with 429 because other people used up its daily limit.
+IP_SITES = (
+    ("https://ipinfo.io/json",
+     lambda d: {"ip": d.get("ip"), "city": d.get("city"), "region": d.get("region"),
+                "country": d.get("country"), "org": d.get("org")}),
+    ("http://ip-api.com/json",
+     lambda d: {"ip": d.get("query"), "city": d.get("city"), "region": d.get("regionName"),
+                "country": d.get("countryCode"), "org": d.get("as") or d.get("isp")}),
+    ("https://api.ipify.org?format=json",
+     lambda d: {"ip": d.get("ip")}),
+)
+
+
+def lookup_exit_ip(proxies, timeout=10):
+    """The IP (and where it is, when known) that sites see through proxies.
+    Returns {"error": ...} only if every lookup site failed."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+    error = None
+    for url, parse in IP_SITES:
+        try:
+            info = parse(json.load(opener.open(url, timeout=timeout)))
+        except Exception as e:
+            error = e
+            continue
+        if info.get("ip"):
+            return info
+    return {"error": str(error)[:60] if error else "no lookup site answered"}
+
+
 def status():
     cfg = load_config()
     st = state(cfg)
@@ -2113,13 +2143,14 @@ def status():
         # Go through the forwarder itself, the path apps take while it's on,
         # and ignore any proxy set in this shell.
         url = f"http://127.0.0.1:{info['port']}"
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({"http": url, "https": url}))
-        try:
-            info = json.load(opener.open("https://ipinfo.io/json", timeout=20))
-            print(f"Exit IP: {info.get('ip')}  {info.get('city')}, {info.get('region')}  "
+        info = lookup_exit_ip({"http": url, "https": url})
+        if "error" in info:
+            print("Could not reach the internet through the proxy:", info["error"])
+        elif info.get("city"):
+            print(f"Exit IP: {info['ip']}  {info.get('city')}, {info.get('region')}  "
                   f"({info.get('org')})")
-        except Exception as e:
-            print("Could not reach the internet through the proxy:", e)
+        else:
+            print(f"Exit IP: {info['ip']}")
 
 
 def main():
