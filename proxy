@@ -15,7 +15,7 @@ import socket
 import sys
 import textwrap
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 try:
     import select
@@ -292,14 +292,26 @@ def current_state(cfg):
         return "unknown"
 
 
-def main():
+def get_balance():
+    # Only ask 2captcha while solving is on, so the dashboard doesn't wait on it otherwise.
+    if not solver.is_enabled():
+        return None
     try:
-        cfg = resproxy.load_config()
+        return float(solver.balance())
+    except Exception:
+        return None
+
+
+def main():
+    notes = io.StringIO()
+    try:
+        with redirect_stderr(notes):
+            cfg = resproxy.load_config()
     except resproxy.ProxyError as e:
         sys.exit(str(e))
     enable_colors()
     global BALANCE
-    message = ""
+    message = notes.getvalue().strip()
     refresh_ip = True
     ip = None
     proxies = {}
@@ -311,10 +323,7 @@ def main():
                 proxies = system_proxies(cfg)
                 draw(cfg, st, None, message, proxies)
                 ip = exit_ip(proxies)
-                try:
-                    BALANCE = float(solver.balance())
-                except Exception:
-                    BALANCE = None
+                BALANCE = get_balance()
                 refresh_ip = False
             draw(cfg, st, ip, message, proxies)
             key = getkey().lower()
@@ -332,6 +341,7 @@ def main():
                 try:
                     solver.set_enabled(not solver.is_enabled())
                     message = f"Captcha solving {'ON' if solver.is_enabled() else 'OFF'}."
+                    BALANCE = get_balance()
                 except solver.CaptchaError as e:
                     message = str(e)
                 continue

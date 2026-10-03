@@ -126,7 +126,27 @@ def load_config():
     if not isinstance(services, list) or not all(isinstance(s, str) for s in services):
         raise ConfigError(f'services in {CONFIG_FILE} should be a list of names, like ["Wi-Fi"], or []')
     cfg["services"] = services
+    private_config()
     return cfg
+
+
+def private_config():
+    """config.json holds the proxy password, so keep it readable by this user only."""
+    if WINDOWS:
+        return
+    try:
+        mode = CONFIG_FILE.stat().st_mode & 0o777
+        if not mode & 0o077:
+            return
+    except OSError:
+        return
+    try:
+        os.chmod(CONFIG_FILE, 0o600)
+        print(f"Note: {CONFIG_FILE} could be read by other users, so it was made private to you.",
+              file=sys.stderr)
+    except OSError as e:
+        print(f"Note: {CONFIG_FILE} can be read by other users and could not be made private: "
+              f"{e.strerror or e}", file=sys.stderr)
 
 
 def this_computer(addr):
@@ -169,11 +189,16 @@ class HeadTooBig(Exception):
 
 async def read_head(reader, timeout):
     """Lines of an HTTP head without line endings, or None on EOF. Accepts
-    CRLF and bare LF."""
+    CRLF and bare LF. The whole head must arrive within timeout seconds."""
     lines, size = [], 0
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     while True:
+        left = deadline - loop.time()
+        if left <= 0:
+            raise asyncio.TimeoutError()
         try:
-            line = await asyncio.wait_for(reader.readline(), timeout)
+            line = await asyncio.wait_for(reader.readline(), left)
         except ValueError:
             raise HeadTooBig()
         if not line:
@@ -203,7 +228,7 @@ async def pipe(reader, writer, act):
     """Copy until EOF, then half-close. act["t"] is the last time data moved
     either way; time spent waiting for a peer that doesn't read counts as
     silence. Only tunnel() decides when silence has gone on too long."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         while True:
             data = await reader.read(65536)
@@ -252,7 +277,7 @@ async def tunnel(client_r, client_w, up_r, up_w):
     """Copy both ways until both sides are done. With no client_r, copy only
     from the upstream to the client. A tunnel silent for IDLE, or silent for
     LINGER once one side has finished, is cut with a reset."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     act = {"t": loop.time()}
     pending = {asyncio.ensure_future(pipe(up_r, client_w, act))}
     if client_r is not None:
@@ -307,10 +332,10 @@ async def copy_chunked(reader, writer):
         if not line.endswith(b"\n"):
             raise ConnectionError("connection closed early")
         writer.write(line)
-        try:
-            size = int(line.split(b";")[0].strip(), 16)
-        except ValueError:
+        size = line.split(b";")[0].strip(b" \t\r\n")
+        if not re.fullmatch(rb"[0-9A-Fa-f]{1,16}", size):
             raise ConnectionError("bad chunk size")
+        size = int(size, 16)
         if size == 0:
             while True:
                 line = await asyncio.wait_for(reader.readline(), IDLE)
@@ -336,9 +361,11 @@ async def copy_body(reader, writer, lines, until_eof):
         await tunnel(None, writer, reader, None)
 
 
-async def send_status(writer, status):
+async def send_status(writer, status, body=b""):
     try:
-        writer.write(f"HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".encode())
+        writer.write(f"HTTP/1.1 {status}\r\nContent-Length: {len(body)}\r\n".encode()
+                     + (b"Content-Type: text/plain\r\n" if body else b"")
+                     + b"Connection: close\r\n\r\n" + body)
         await writer.drain()
     except Exception:
         pass
@@ -359,6 +386,40 @@ async def reject(client_r, client_w, status):
 def status_code(line):
     parts = line.split()
     return parts[1] if len(parts) > 1 and line.startswith(b"HTTP/") else b""
+
+
+# Sent instead of the upstream's 407, so browsers don't ask for a login
+# that would be replaced anyway. on looks for this text.
+LOGIN_REJECTED = b"The upstream proxy rejected the username or password in config.json.\n"
+
+
+async def login_rejected(writer):
+    log("upstream rejected credentials")
+    await send_status(writer, "502 Bad Gateway", LOGIN_REJECTED)
+
+
+# Never dropped, even if named in Connection: the body is copied as framed by these.
+FRAMING = {b"content-length", b"transfer-encoding", b"host"}
+
+
+def hop_headers(lines, extra=()):
+    """Names (lowercase) of the headers that only concern this hop: the
+    standard ones and the ones named in Connection. Proxy-* headers are
+    always dropped by strip_headers."""
+    names = {b"connection", b"keep-alive", b"te"} | set(extra)
+    for h in lines:
+        if h.lower().startswith(b"connection:"):
+            names.update(t.strip().lower() for t in h.split(b":", 1)[1].split(b","))
+    return names - FRAMING - {b""}
+
+
+def strip_headers(lines, names):
+    out = []
+    for h in lines:
+        name = h.split(b":", 1)[0].strip().lower()
+        if name not in names and not name.startswith(b"proxy-"):
+            out.append(h)
+    return out
 
 
 async def relay_plain(client_r, client_w, up_r, up_w, method, body):
@@ -392,17 +453,24 @@ async def relay_plain(client_r, client_w, up_r, up_w, method, body):
                 return
             await tunnel(client_r, client_w, up_r, up_w)
             return
-        drop = (b"connection:", b"keep-alive:", b"proxy-connection:")
-        kept = [h for h in resp[1:] if not h.lower().startswith(drop)]
+        if code == b"407" and not sent:
+            await login_rejected(client_w)
+            return
+        kept = strip_headers(resp[1:], hop_headers(resp[1:], [b"upgrade"]))
         client_w.write(b"\r\n".join([resp[0]] + kept + [b"Connection: close"]) + b"\r\n\r\n")
+        sent = True
         await client_w.drain()
         if method != b"HEAD" and code not in (b"204", b"304"):
             await copy_body(up_r, client_w, resp, True)
     except HeadTooBig:
         if not sent:
             await send_status(client_w, "502 Bad Gateway")
+        else:
+            reset(client_w, up_w)
     except Exception:
-        pass
+        # Cut short after the reply started: reset, so it can't look complete.
+        if sent:
+            reset(client_w, up_w)
 
 
 async def handle_client(client_r, client_w, cfg, auth, token):
@@ -436,13 +504,20 @@ async def handle_client(client_r, client_w, cfg, auth, token):
             await client_w.drain()
             return
         is_connect = method == b"CONNECT"
+        if not is_connect and parts[1][:7].lower() != b"http://":
+            # Only proxy requests (GET http://host/...). A plain "GET /" is
+            # someone treating this as a web server; don't send the login on.
+            await reject(client_r, client_w, "400 Bad Request")
+            return
 
-        # Drop anything the client sent about proxy auth or keep-alive and add ours.
+        # Drop anything the client sent about proxy auth or this hop and add ours.
         upgrade = not is_connect and header(headers, b"upgrade") is not None
-        drop = (b"proxy-authorization:", b"proxy-connection:")
-        if not is_connect:
-            drop += (b"connection:", b"keep-alive:")
-        kept = [h for h in headers if not h.lower().startswith(drop)]
+        if is_connect:
+            kept = strip_headers(headers, set())
+        elif upgrade:
+            kept = strip_headers(headers, {b"connection", b"keep-alive", b"te"})
+        else:
+            kept = strip_headers(headers, hop_headers(headers, [b"upgrade"]))
         kept.append(b"Proxy-Authorization: Basic " + auth)
         if upgrade:
             # Keep the client's own tokens (HTTP2-Settings, say), not the
@@ -482,6 +557,9 @@ async def handle_client(client_r, client_w, cfg, auth, token):
                     resp = None
                 if not resp:
                     await send_status(client_w, "502 Bad Gateway")
+                    return
+                if status_code(resp[0]) == b"407":
+                    await login_rejected(client_w)
                     return
                 client_w.write(b"\r\n".join(resp) + b"\r\n\r\n")
                 await client_w.drain()
@@ -813,10 +891,19 @@ def port_open(port):
         return s.connect_ex(("127.0.0.1", int(port))) == 0
 
 
+LOG_MAX = 1024 * 1024
+
+
 def spawn_forwarder(token):
     env = dict(os.environ, RESPROXY_TOKEN=token)
     try:
         make_dir(STATE_DIR)
+        # Keep the log small: past 1 MB, start a new one and keep one old one.
+        try:
+            if LOG_FILE.stat().st_size > LOG_MAX:
+                os.replace(LOG_FILE, LOG_FILE.with_name(LOG_FILE.name + ".1"))
+        except OSError:
+            pass
         logf = open(LOG_FILE, "a")
     except OSError as e:
         raise ProxyError(f"Could not write {LOG_FILE}: {e.strerror or e}")
@@ -876,6 +963,44 @@ def start_forwarder(cfg):
         time.sleep(0.1)
     stop_forwarder(info)
     raise ProxyError(f"Forwarder did not start. See {LOG_FILE}")
+
+
+CHECK_TARGET = b"example.com:443"
+CHECK_TIMEOUT = 10
+
+
+def check_login(port):
+    """Open one tunnel through the forwarder, so a wrong login shows up now
+    rather than as pages that won't load. Only a refused login stops on;
+    anything else (offline, say) is just a note. Set RESPROXY_NO_LOGIN_CHECK=1
+    to skip it."""
+    if os.environ.get("RESPROXY_NO_LOGIN_CHECK"):
+        return
+    deadline = time.monotonic() + CHECK_TIMEOUT
+    data = b""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=CHECK_TIMEOUT) as s:
+            s.sendall(b"CONNECT " + CHECK_TARGET + b" HTTP/1.1\r\nHost: " + CHECK_TARGET + b"\r\n\r\n")
+            while len(data) < 4096 and not (b"\r\n\r\n" in data and data.startswith(b"HTTP/1.1 2")):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise socket.timeout("timed out")
+                s.settimeout(left)
+                chunk = s.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+    except OSError as e:
+        if not data:
+            print(f"Note: could not check the proxy login just now ({e}). "
+                  "If pages don't load, check your connection and config.json.")
+            return
+    if LOGIN_REJECTED in data:
+        raise ProxyError("The proxy rejected your username or password. Check config.json.")
+    if not data.startswith(b"HTTP/1.1 2"):
+        status = data.split(b"\r\n", 1)[0].decode("latin-1")[:60] or "no answer"
+        print(f"Note: could not check the proxy login just now ({status}). "
+              "If pages don't load, check your connection and config.json.")
 
 
 def stop_forwarder(info=None):
@@ -969,7 +1094,8 @@ class MacBackend:
     name = "macos"
     KINDS = ["webproxy", "securewebproxy", "socksfirewallproxy"]
     BLANK = {"enabled": False, "server": "", "port": "0", "auth": False}
-    EXTRA_BYPASS = ["localhost", "127.0.0.1", "::1", "*.local", "169.254/16", "100.64.0.0/10"]
+    EXTRA_BYPASS = ["localhost", "127.0.0.1", "::1", "*.local", "169.254/16", "100.64.0.0/10",
+                    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
     def check(self, cfg):
         if not os.path.exists(tool("networksetup")):
@@ -1156,7 +1282,10 @@ class WindowsBackend:
     CONN_KEY = KEY + r"\Connections"
     VALUES = ["ProxyEnable", "ProxyServer", "ProxyOverride", "AutoConfigURL"]
     BLOB = "DefaultConnectionSettings"
-    EXTRA_BYPASS = ["localhost", "127.0.0.1", "[::1]", "*.local", "169.254.*"]
+    # No CIDR here, so the private ranges are spelled as wildcards. <local>
+    # is names without a dot, like a printer or router.
+    EXTRA_BYPASS = ["localhost", "127.0.0.1", "[::1]", "*.local", "169.254.*", "10.*", "192.168.*"] \
+        + [f"172.{n}.*" for n in range(16, 32)] + ["<local>"]
 
     def reg(self):
         try:
@@ -1379,7 +1508,8 @@ class GnomeBackend:
             (BASE + ".https", "host"), (BASE + ".https", "port"),
             (BASE + ".socks", "host"), (BASE + ".socks", "port")]
     DESKTOPS = {"gnome", "ubuntu", "unity", "cinnamon", "x-cinnamon", "budgie", "pantheon"}
-    EXTRA_BYPASS = ["localhost", "127.0.0.0/8", "::1", "*.local", "169.254.0.0/16", "100.64.0.0/10"]
+    EXTRA_BYPASS = ["localhost", "127.0.0.0/8", "::1", "*.local", "169.254.0.0/16", "100.64.0.0/10",
+                    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
 
     def __init__(self):
         self.port = 8899
@@ -1790,6 +1920,7 @@ def _turn_on(cfg, backend):
                 pass
     try:
         info = start_forwarder(cfg)
+        check_login(info["port"])
         switch_on(cfg, backend, targets, info["port"])
     except BaseException as e:
         after = ""

@@ -20,8 +20,14 @@ final class Buffer {
     var data = Data()
 }
 
+let missingScript = "Can't find resproxy.py. Keep ResProxy.app in the resproxy folder."
+
 // Blocks until the script exits, so only call this off the main thread.
 func run(_ arg: String) -> Output {
+    // The app was moved away from the script (into Applications, say).
+    if !FileManager.default.fileExists(atPath: script) {
+        return Output(status: -1, out: "", err: missingScript)
+    }
     let p = Process()
     // Apps launched from Finder get a bare PATH, so add the usual python3 locations.
     p.executableURL = URL(fileURLWithPath: "/usr/bin/env")

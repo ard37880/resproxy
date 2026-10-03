@@ -155,6 +155,10 @@ on the desktop instead.
 No. Whatever was set before you turned it on gets saved and restored when you
 turn it off.
 
+**Is my proxy login safe on public Wi-Fi?**
+It goes to your provider as plain HTTP proxy auth, so someone on the same
+network could see it. Use a VPN or a provider with TLS if that matters to you.
+
 **Does everything go through the proxy?**
 Browsers and most apps do. Terminal tools like `curl` and `git` ignore the
 system proxy, and video calls and games won't go through it. On Windows, some
