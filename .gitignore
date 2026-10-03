@@ -1,0 +1,9 @@
+# Your proxy login and API key. Never commit this.
+config.json
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# Built locally with build-app.sh
+ResProxy.app/

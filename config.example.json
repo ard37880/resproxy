@@ -1,0 +1,9 @@
+{
+  "upstream_host": "proxy.example.com",
+  "upstream_port": 2334,
+  "username": "YOUR_PROXY_USERNAME",
+  "password": "YOUR_PROXY_PASSWORD",
+  "local_port": 8899,
+  "services": [],
+  "captcha_api_key": "YOUR_2CAPTCHA_API_KEY"
+}

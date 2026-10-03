@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""Terminal dashboard for the residential proxy.
+
+Run from this folder:  python3 proxy   (on Windows: py proxy)
+"""
+
+import getpass
+import io
+import json
+import math
+import os
+import re
+import shutil
+import socket
+import sys
+import textwrap
+import urllib.request
+from contextlib import redirect_stdout
+
+try:
+    import select
+    import termios
+    import tty
+except ImportError:
+    termios = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import resproxy  # noqa: E402
+import solver  # noqa: E402
+
+BALANCE = None
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED, GREEN, YELLOW, BLUE, CYAN, WHITE = (f"\033[{n}m" for n in (31, 32, 33, 34, 36, 37))
+BRED, BGREEN = "\033[91m", "\033[92m"
+CLEAR, HIDE_CURSOR, SHOW_CURSOR = "\033[2J\033[H", "\033[?25l", "\033[?25h"
+COLOR = True
+ANSI = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
+
+
+def enable_colors():
+    """Windows consoles need escape codes switched on. If that fails, draw
+    without colors."""
+    global RESET, BOLD, DIM, RED, GREEN, YELLOW, BLUE, CYAN, WHITE, BRED, BGREEN
+    global CLEAR, HIDE_CURSOR, SHOW_CURSOR, COLOR
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.GetStdHandle(-11)
+        mode = ctypes.c_uint32()
+        if k32.GetConsoleMode(h, ctypes.byref(mode)) and k32.SetConsoleMode(h, mode.value | 0x0004):
+            return
+    except Exception:
+        pass
+    RESET = BOLD = DIM = RED = GREEN = YELLOW = BLUE = CYAN = WHITE = BRED = BGREEN = ""
+    CLEAR, HIDE_CURSOR, SHOW_CURSOR, COLOR = "\n" * 3, "", "", False
+
+
+def fit(line, width):
+    """Cut a line to width visible characters, keeping color codes intact."""
+    out, n, i = "", 0, 0
+    while i < len(line):
+        m = ANSI.match(line, i)
+        if m:
+            out += m.group()
+            i = m.end()
+            continue
+        if n >= width:
+            return out + RESET
+        out += line[i]
+        n += 1
+        i += 1
+    return out
+
+
+BANNER = r"""
+ _____  ______  _____ _____  _____   ______   ____     __
+|  __ \|  ____|/ ____|  __ \|  __ \ / __ \ \ / /\ \   / /
+| |__) | |__  | (___ | |__) | |__) | |  | \ V /  \ \_/ /
+|  _  /|  __|  \___ \|  ___/|  _  /| |  | |> <    \   /
+| | \ \| |____ ____) | |    | | \ \| |__| / . \    | |
+|_|  \_\______|_____/|_|    |_|  \_\\____/_/ \_\   |_|
+""".strip("\n").splitlines()
+
+
+def globe(on, rows=19, cols=38):
+    """A wireframe globe drawn in letters, green when on and red when off."""
+    line_c, fill_c = (BGREEN, GREEN) if on else (BRED, RED)
+    out = []
+    for r in range(rows):
+        v = 1 - 2 * (r + 0.5) / rows
+        row = ""
+        for c in range(cols):
+            u = 2 * (c + 0.5) / cols - 1
+            d = u * u + v * v
+            if d > 1:
+                row += " "
+                continue
+            z = math.sqrt(1 - d)
+            lat = math.degrees(math.asin(v))
+            lon = math.degrees(math.atan2(u, z)) + 15
+            near = lambda a, step, tol: min(a % step, step - a % step) < tol
+            if d > 0.86:
+                row += fill_c + (":" if d > 0.95 else "+")
+            elif near(lat, 30, 3.4) or near(lon, 30, 2.6):
+                row += line_c + BOLD + "M" + RESET
+            else:
+                row += fill_c + ("s" if z > 0.75 else "o" if z > 0.45 else "+")
+        out.append(row + RESET)
+    return out
+
+
+def exit_ip(proxies):
+    # Use the system proxy, the same path the browser takes, so this shows
+    # what apps really get, on or off.
+    try:
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+        return json.load(opener.open("https://ipinfo.io/json", timeout=15))
+    except Exception as e:
+        return {"error": str(e)[:60]}
+
+
+def system_proxies(cfg):
+    try:
+        return resproxy.system_proxies(cfg)
+    except Exception:
+        return {}
+
+
+def restore_target(cfg):
+    """What the system goes back to when the proxy is switched off."""
+    try:
+        return resproxy.restore_summary(cfg)
+    except Exception:
+        return "unknown"
+
+
+def off_note(proxies):
+    via = proxies.get("https") or proxies.get("http")
+    return f"via system proxy {via.split('://')[-1]}" if via else "no proxy"
+
+
+def services_label(cfg):
+    try:
+        backend = resproxy.get_backend()
+        return backend.label(backend.targets(cfg))
+    except Exception:
+        return "unknown"
+
+
+def username():
+    try:
+        return getpass.getuser()
+    except Exception:
+        return "user"
+
+
+def info_lines(cfg, st, ip, proxies, bars=True):
+    on = st == "on"
+    user = username()
+    host = socket.gethostname().split(".")[0]
+    region = re.search(r"region-([a-z]+)", cfg["username"])
+    label = lambda k, v: f"{CYAN}{BOLD}{k}{RESET}: {v}"
+    state = {"on": f"{BGREEN}{BOLD}ON{RESET}",
+             "broken": f"{BRED}{BOLD}BROKEN{RESET} {YELLOW}forwarder not running, apps can't connect. "
+                       f"Press 2 to restore or 1 to restart{RESET}",
+             "partial": f"{YELLOW}{BOLD}PARTIAL{RESET} {YELLOW}the network in use isn't switched. "
+                        f"Press 1 to switch it{RESET}",
+             "unfinished": f"{YELLOW}{BOLD}UNFINISHED{RESET} {YELLOW}off didn't finish. "
+                           f"Press 2 to finish it{RESET}",
+             "off": f"{BRED}{BOLD}OFF{RESET}"}.get(
+                 st, f"{YELLOW}{BOLD}UNKNOWN{RESET} {YELLOW}can't read the system proxy settings from here{RESET}")
+    title = f"{CYAN}{BOLD}{user}{RESET}@{CYAN}{BOLD}{host}{RESET}"
+    lines = [title, "-" * len(f"{user}@{host}"), label("Proxy", state)]
+    if ip is None:
+        lines.append(label("Exit IP", f"{DIM}checking...{RESET}"))
+    elif "error" in ip:
+        lines.append(label("Exit IP", f"{YELLOW}unreachable ({ip['error']}){RESET}"))
+    else:
+        lines += [
+            label("Exit IP", str(ip.get("ip", "?")) + ("" if on else f" {DIM}({off_note(proxies)}){RESET}")),
+            label("Location", f"{ip.get('city', '?')}, {ip.get('region', '?')}, {ip.get('country', '?')}"),
+            label("ISP", ip.get("org", "?")),
+        ]
+    lines += [
+        label("Upstream", f"{cfg['upstream_host']}:{cfg['upstream_port']}"),
+        label("Region", region.group(1).upper() if region else "any"),
+        label("Local", f"127.0.0.1:{cfg['local_port']}"),
+        label("Network", services_label(cfg)),
+        label("Off restores", restore_target(cfg)),
+        label("Captcha", (f"{BGREEN}{BOLD}ON{RESET}" if solver.is_enabled() else f"{BRED}{BOLD}OFF{RESET}")
+              + (f"  {DIM}balance ${BALANCE:.2f}{RESET}" if isinstance(BALANCE, float) else "")),
+    ]
+    if bars and COLOR:
+        lines += ["",
+                  "".join(f"\033[4{n}m   " for n in range(8)) + RESET,
+                  "".join(f"\033[10{n}m   " for n in range(8)) + RESET]
+    return lines
+
+
+def draw(cfg, st, ip, message, proxies):
+    on = st == "on"
+    size = shutil.get_terminal_size((100, 40))
+    width, height = size.columns, size.lines
+    big = width >= 62 and height >= 34
+    banner_c = BGREEN if on else BRED if st in ("off", "broken") else YELLOW
+    if big:
+        out = [f"  {banner_c}{line}{RESET}" for line in BANNER]
+    else:
+        out = [f"  {banner_c}{BOLD}RESPROXY{RESET}"]
+    out.append("")
+    # Wrap each line of the message so nothing is cut off at the edge.
+    msg = [w for line in message.splitlines() for w in textwrap.wrap(line, max(width - 3, 20)) or [""]]
+    footer = 2 + (len(msg) + 1 if msg else 0)
+    # Size the globe to what's left, so the frame fits a small window too.
+    rows = min(19, height - len(out) - footer - 1, (width - 46) // 2)
+    info = info_lines(cfg, st, ip, proxies, bars=big)
+    if len(out) + len(info) + 2 + footer > height - 1:
+        rows = 0  # a long message needs the room more than the globe does
+    art = globe(on, rows, rows * 2) if rows >= 7 else []
+    pad = rows * 2 + 2 if art else 0
+    top = 2 if art else 0
+    for i in range(max(len(art), len(info) + top)):
+        left = art[i] if i < len(art) else ""
+        right = info[i - top] if 0 <= i - top < len(info) else ""
+        line = left + " " * (pad - len(ANSI.sub("", left))) + right
+        out.append(fit("  " + line, width - 1))
+    out.append("")
+    if msg:
+        out += [fit(f"  {YELLOW}{line}{RESET}", width - 1) for line in msg]
+        out.append("")
+    keys = [("1", "On"), ("2", "Off"), ("3", "Toggle"), ("4", "Status"), ("5", "Captcha"), ("q", "Quit")]
+    out.append(fit("  " + "   ".join(f"{BOLD}[{k}]{RESET} {name}" for k, name in keys), width - 1))
+    sys.stdout.write(CLEAR + "\n".join(out) + "\n")
+    sys.stdout.flush()
+
+
+def getkey():
+    fd = sys.stdin.fileno()
+    if not os.isatty(fd):
+        return (sys.stdin.readline().strip() or "q")[0]
+    if msvcrt:
+        key = msvcrt.getwch()
+        if key in ("\x00", "\xe0") and msvcrt.kbhit():
+            # Arrow and function keys arrive as a prefix plus one more key.
+            # A typed a-grave is the same character with nothing after it.
+            msvcrt.getwch()
+            return ""
+        return key
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        key = os.read(fd, 1)
+        if key == b"\x1b" and select.select([fd], [], [], 0.05)[0]:
+            # Arrow and function keys send ESC plus more bytes. Swallow the
+            # whole sequence so it neither quits nor leaks into the shell.
+            while select.select([fd], [], [], 0.05)[0]:
+                os.read(fd, 64)
+            return ""
+        return key.decode(errors="ignore")
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def run_action(fn):
+    """Everything the action printed, notes included, then any error."""
+    buf = io.StringIO()
+    err = ""
+    try:
+        with redirect_stdout(buf):
+            fn()
+    except SystemExit as e:
+        err = str(e.code or "Failed.")
+    except Exception as e:
+        err = f"Error: {e}"
+    lines = [l.rstrip() for l in buf.getvalue().splitlines() if l.strip()]
+    return "\n".join(lines + ([err] if err else []))
+
+
+def current_state(cfg):
+    try:
+        return resproxy.state(cfg)
+    except Exception:
+        return "unknown"
+
+
+def main():
+    try:
+        cfg = resproxy.load_config()
+    except resproxy.ProxyError as e:
+        sys.exit(str(e))
+    enable_colors()
+    global BALANCE
+    message = ""
+    refresh_ip = True
+    ip = None
+    proxies = {}
+    sys.stdout.write(HIDE_CURSOR)
+    try:
+        while True:
+            st = current_state(cfg)
+            if refresh_ip:
+                proxies = system_proxies(cfg)
+                draw(cfg, st, None, message, proxies)
+                ip = exit_ip(proxies)
+                try:
+                    BALANCE = float(solver.balance())
+                except Exception:
+                    BALANCE = None
+                refresh_ip = False
+            draw(cfg, st, ip, message, proxies)
+            key = getkey().lower()
+            if key == "1":
+                message = run_action(resproxy.turn_on)
+            elif key == "2":
+                message = run_action(resproxy.turn_off)
+            elif key == "3":
+                # Decides from the state at the moment of the key press, not
+                # from what was on screen.
+                message = run_action(resproxy.turn_toggle)
+            elif key == "4":
+                message = "Status refreshed."
+            elif key == "5":
+                try:
+                    solver.set_enabled(not solver.is_enabled())
+                    message = f"Captcha solving {'ON' if solver.is_enabled() else 'OFF'}."
+                except solver.CaptchaError as e:
+                    message = str(e)
+                continue
+            elif key in ("q", "\x1b", "\x03"):
+                break
+            else:
+                continue
+            refresh_ip = True
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write(SHOW_CURSOR + RESET + "\n")
+        st = current_state(cfg)
+        print("  Proxy is OFF." if st == "off" else "  Proxy is still ON." if st == "on"
+              else "  " + resproxy.MESSAGES.get(st, resproxy.UNKNOWN_MSG))
+
+
+if __name__ == "__main__":
+    main()
